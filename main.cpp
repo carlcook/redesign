@@ -4,6 +4,7 @@
 #include <map>
 #include <string>
 #include <cassert>
+#include <queue>
 
 #include <errno.h>
 #include <string.h>
@@ -11,9 +12,6 @@
 #include <sys/types.h>
 #include <sys/stat.h>
 #include <unistd.h>
-
-using namespace std;
-using Callback = std::function<void(void)>;
 
 class PipeListener
 {
@@ -26,6 +24,7 @@ class EventEngine
 {
   // sit in a loop listening to a message queue
 private:
+using Callback = std::function<void(void)>;
   std::vector<Callback> mCallbacks;
   std::map<int, PipeListener*> mPipeListeners;
 
@@ -73,29 +72,13 @@ public:
         if (available > 0 && FD_ISSET(kv.first, &readset))
         {
           int n = read(kv.first, buf, sizeof(buf));
-          if (n == 2)
-          {
-            int command = atoi(buf);
-            switch (command)
-            {
-            case 0:
-              kv.second->OnData("0", 2);
-              break;
-            case 1:
-              kv.second->OnData("1", 2);
-              break;
-            case 2:
-              kv.second->OnData("2", 2);
-              break;
-            default:
-              throw std::runtime_error("Unknown pipe command");
-              break;
-            }
-          }
+          if (n != 2)
+            throw std::runtime_error("Didn't read full message");
+          kv.second->OnData(buf, sizeof(buf));
         }
       }
 
-      // also clear callback queue
+      // callback queue
       for (auto& callback : mCallbacks)
       {
         callback();
@@ -172,11 +155,109 @@ public:
   }
 };
 
+class MessageQueue
+{
+public:
+  struct Message
+  {
+    int mType = 0;
+  };
+
+  void WriteMessage(const Message& message)
+  {
+    mQueue.push(message);
+  }
+
+  bool TryReadMessage(Message& message)
+  {
+    if (mQueue.empty())
+      return false;
+    message = mQueue.front();
+    mQueue.pop();
+  }
+private:
+  std::queue<Message> mQueue;
+};
+
+struct Instrument
+{
+  std::pair<int, int> mPriceCollar = {0,0};
+};
+
+class AdminThread : private PipeListener
+{
+private:
+  EventEngine& mEventEngine;
+  MessageQueue mMessageQueue;
+  Instrument mInstrument;
+public:
+  AdminThread(EventEngine& eventEngine) :
+    mEventEngine(eventEngine)
+  {
+    mEventEngine.RegisterPipeListener("/tmp/AdminThread", *this);
+  }
+
+  Instrument& GetInstrument()
+  {
+    return mInstrument;
+  }
+
+
+  void OnData(const char* data, size_t msgLen) override
+  {
+    int command = atoi(data);
+    switch (command)
+    {
+      case 1:
+        HandlePriceCollarUpdate(1, 2);
+        break;
+      default:
+        throw std::runtime_error("Invalid data sent to admin thread");
+    }
+  }
+
+  // can be called from order manager
+  void DoWork(const MessageQueue::Message& message)
+  {
+    mMessageQueue.WriteMessage(message);
+  }
+
+  void HandlePriceCollarUpdate(int i, int j)
+  {
+    // TODO make threadsafe
+    mInstrument.mPriceCollar.first = i;
+    mInstrument.mPriceCollar.first = j;
+  }
+
+  void Start()
+  {
+    while (true)
+    {
+        MessageQueue::Message message;
+        if (mMessageQueue.TryReadMessage(message))
+        {
+            switch (message.mType)
+            {
+              case 1:
+                std::cout << "Admin thread should pubsub a trade feed\n";
+                break;
+              case 2:
+                std::cout << "Admin thread should write to price collar data\n";
+                break;
+              default:
+                throw std::runtime_error("Unknown message type in worker thread\n");
+            }
+        }
+    }
+  }
+};
+
 class OrderManager : private PipeListener
 {
 private:
   EventEngine& mEventEngine;
   ExecModule mExecModule;
+  AdminThread& mAdminThread;
 
   enum class OrderState
   {
@@ -200,7 +281,17 @@ private:
     std::cout << "Order manager: received order insert message\n";
     mOrders.insert(std::make_pair(orderInsertMsg.mTag, Order()));
 
-    // TODO now check price collars
+    // check price collars // TODO make threadsafe
+    if (mAdminThread.GetInstrument().mPriceCollar.first == 0)
+    {
+      std::cout << "Order manager: invalid collar\n";
+      return; // invalid collar
+    }
+    if (mAdminThread.GetInstrument().mPriceCollar.second == 0)
+    {
+      std::cout << "Order manager: invalid collar\n";
+      return; // invalid collar
+    }
 
     auto fillCallback = [this](int tag)
     {
@@ -209,7 +300,7 @@ private:
       // update order state again
       auto& order = mOrders[tag];
       order.mOrderState = OrderState::Filled;
-      // TODO slow thread work
+      // TODO any slow thread work, such as writing to an order log
     };
     mExecModule.SendInsert(orderInsertMsg, [this](int tag)
     {
@@ -220,40 +311,41 @@ private:
         order.mOrderState = OrderState::Inserted;
         // TODO other slow thread things here (i.e. push into slow thread message queue)
     }, fillCallback);
-    // TODO pubsub out a message that we have an order insert, but do this on the slow thread, by passing a message to slow thread
+    // send pubsub message
+    MessageQueue::Message message;
+    message.mType = 1; // pubsub
+    mAdminThread.DoWork(message);
   }
 
 public:
-  OrderManager(EventEngine& eventEngine) :
+  OrderManager(EventEngine& eventEngine, AdminThread& adminThread) :
     mEventEngine(eventEngine),
-    mExecModule(mEventEngine)
+    mExecModule(mEventEngine),
+    mAdminThread(adminThread)
   {
     mEventEngine.RegisterPipeListener("/tmp/OrderManager", *this);
   }
 
   void OnData(const char* data, size_t msgLen) override
   {
-    // assume that this is an order insert message
-    HandleInsertOrder(OrderInsertMsg());
-  }
-};
-
-// TODO complete this and make it thread safe
-class MessageQueue
-{
-  void WriteMessage()
-  {
-  }
-  void ReadMessage()
-  {
+    int command = atoi(data);
+    switch (command)
+    {
+    case 1:
+      HandleInsertOrder(OrderInsertMsg());
+      break;
+    default:
+      throw std::runtime_error("Unknown order manager command");
+    }
   }
 };
 
 int main()
 {
-  MessageQueue messageQueue;
   EventEngine eventEngine;
-  OrderManager orderManager(eventEngine);
+  AdminThread adminThread(eventEngine);
+  // TODO start admin thread
+  OrderManager orderManager(eventEngine, adminThread);
   eventEngine.Start();
 
   // TODO have a second thread which does the slow work (writes to output pipe, etc), including a single writer, single reader message queue
