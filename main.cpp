@@ -5,6 +5,7 @@
 #include <string>
 #include <cassert>
 #include <queue>
+#include <thread>
 
 #include <errno.h>
 #include <string.h>
@@ -181,20 +182,70 @@ private:
 
 struct Instrument
 {
-  std::pair<int, int> mPriceCollar = {0,0};
+  std::tuple<int, int> mPriceCollar = std::make_tuple(0,0);
 };
 
-class AdminThread : private PipeListener
+class AdminThread
 {
 private:
-  EventEngine& mEventEngine;
   MessageQueue mMessageQueue;
   Instrument mInstrument;
+  int mReadFd;
 public:
-  AdminThread(EventEngine& eventEngine) :
-    mEventEngine(eventEngine)
+  AdminThread()
   {
-    mEventEngine.RegisterPipeListener("/tmp/AdminThread", *this);
+    if (mkfifo("/tmp/AdminThread", S_IWUSR | S_IRUSR | S_IRGRP | S_IROTH) == -1)
+    {
+      if (errno != EEXIST)
+        throw std::runtime_error(strerror(errno));
+    }
+    if ((mReadFd = open("/tmp/AdminThread", O_RDONLY | O_NONBLOCK)) < 0)
+      throw std::runtime_error(strerror(errno));
+    // not needed, but keeps pipe open
+    int writeFd;
+    if ((writeFd = open("/tmp/AdminThread", O_WRONLY | O_NONBLOCK)) < 0)
+      throw std::runtime_error(strerror(errno));
+  }
+
+  void Start()
+  {
+    while (true)
+    {
+       char buf[2];
+       fd_set readset;
+       struct timeval tv;
+       tv.tv_sec = 0;
+       tv.tv_usec = 100000;
+       FD_ZERO(&readset);
+       FD_SET(mReadFd, &readset);
+       int available = select(mReadFd + 1, &readset, NULL, NULL, &tv);
+       if (available == -1)
+         throw std::runtime_error("Select failed");
+       if (available > 0 && FD_ISSET(mReadFd, &readset))
+       {
+         int n = read(mReadFd, buf, sizeof(buf));
+         if (n == 2)
+         {
+            OnData(buf, sizeof(buf));
+         }
+         else
+         {
+            throw std::runtime_error("Didn't read full message");
+         }
+       }
+       MessageQueue::Message message;
+       if (mMessageQueue.TryReadMessage(message))
+       {
+         switch (message.mType)
+         {
+         case 1:
+           std::cout << "Admin thread: published a trade feed\n";
+           break;
+         default:
+           throw std::runtime_error("Unknown message type in worker thread\n");
+         }
+       }
+     }
   }
 
   Instrument& GetInstrument()
@@ -202,8 +253,7 @@ public:
     return mInstrument;
   }
 
-
-  void OnData(const char* data, size_t msgLen) override
+  void OnData(const char* data, size_t msgLen)
   {
     int command = atoi(data);
     switch (command)
@@ -225,33 +275,14 @@ public:
   void HandlePriceCollarUpdate(int i, int j)
   {
     // TODO make threadsafe
-    mInstrument.mPriceCollar.first = i;
-    mInstrument.mPriceCollar.first = j;
-  }
-
-  void Start()
-  {
-    while (true)
-    {
-        MessageQueue::Message message;
-        if (mMessageQueue.TryReadMessage(message))
-        {
-            switch (message.mType)
-            {
-              case 1:
-                std::cout << "Admin thread should pubsub a trade feed\n";
-                break;
-              case 2:
-                std::cout << "Admin thread should write to price collar data\n";
-                break;
-              default:
-                throw std::runtime_error("Unknown message type in worker thread\n");
-            }
-        }
-    }
+    std::get<0>(mInstrument.mPriceCollar) = i;
+    std::get<1>(mInstrument.mPriceCollar) = j;
+    std::cout << this << " \n";
   }
 };
 
+// this class would read from shared memory in practice (but I use a pipe)
+// it would also need to use the event engine though, as it polls for sockets from the exchange
 class OrderManager : private PipeListener
 {
 private:
@@ -282,12 +313,12 @@ private:
     mOrders.insert(std::make_pair(orderInsertMsg.mTag, Order()));
 
     // check price collars // TODO make threadsafe
-    if (mAdminThread.GetInstrument().mPriceCollar.first == 0)
+    if (std::get<0>(mAdminThread.GetInstrument().mPriceCollar) == 0)
     {
-      std::cout << "Order manager: invalid collar\n";
+      std::cout << "Order manager: invalid collar " << std::get<0>(mAdminThread.GetInstrument().mPriceCollar) << &mAdminThread << "\n";
       return; // invalid collar
     }
-    if (mAdminThread.GetInstrument().mPriceCollar.second == 0)
+    if (std::get<1>(mAdminThread.GetInstrument().mPriceCollar) == 0)
     {
       std::cout << "Order manager: invalid collar\n";
       return; // invalid collar
@@ -305,7 +336,6 @@ private:
     mExecModule.SendInsert(orderInsertMsg, [this](int tag)
     {
         std::cout << "Order manager: received order reply\n";
-
         // update order state again now that we have been called back
         auto& order = mOrders[tag];
         order.mOrderState = OrderState::Inserted;
@@ -313,7 +343,7 @@ private:
     }, fillCallback);
     // send pubsub message
     MessageQueue::Message message;
-    message.mType = 1; // pubsub
+    message.mType = 1;
     mAdminThread.DoWork(message);
   }
 
@@ -343,13 +373,12 @@ public:
 int main()
 {
   EventEngine eventEngine;
-  AdminThread adminThread(eventEngine);
-  // TODO start admin thread
+  AdminThread adminThread;
+  std::thread thread(&AdminThread::Start, std::ref(adminThread));
   OrderManager orderManager(eventEngine, adminThread);
   eventEngine.Start();
+  thread.join();
 
-  // TODO have a second thread which does the slow work (writes to output pipe, etc), including a single writer, single reader message queue
-  // TODO handle price collars - write to ping pong buffer, and then inspect (generate randomly from slow thread)
   // TODO replace std functions with lambdas
   // TODO implement own callable queue?
 }
